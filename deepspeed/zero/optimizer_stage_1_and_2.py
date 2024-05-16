@@ -1,953 +1,887 @@
-import math
-from collections import defaultdict
-
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
-
-try:
-    from torch._six import inf
-except ImportError:
-    from torch import inf
-
+from collections import OrderedDict
 from deepspeed import comm as dist
+import types
+from dataclasses import dataclass
+from typing import Dict
+import os
+
 from deepspeed.utils import logger
-from deepspeed.runtime.utils import CheckOverflow
+from deepspeed.utils.constants import *
+from .loss_scaler import CreateLossScaler
+from .utils import *
+
+pg_correctness_test = False
 
 
-# from .. import mpu
-
-
-def get_data_parallel_partitions(self, tensor):
-    partitions = []
-
-    dp = dist.get_world_size(group=self.dp_process_group)
-    dp_id = dist.get_rank(group=self.dp_process_group)
-
-    total_num_elements = tensor.numel()
-
-    base_size = total_num_elements // dp
-    remaining = total_num_elements % dp
-
-    start = 0
-    for id in range(dp):
-        partition_size = base_size
-        if id < remaining:
-            partition_size = partition_size + 1
-        partitions.append(tensor.narrow(0, start, partition_size))
-        start = start + partition_size
-    return partitions
-
-
-def get_alignment_padding(flattened_lean_size, sub_partition_id, sub_partition_size):
-    sub_partition_high_limit = (sub_partition_id + 1) * sub_partition_size
-    if sub_partition_high_limit <= flattened_lean_size:
-        return 0
-    else:
-        return min(sub_partition_size, sub_partition_high_limit - flattened_lean_size)
-
-
-def get_group_alignment_padding(tensor_list, sub_partition_size, sub_partition_count):
-    group_paddings = []
-    flattened_size = sum([tensor.numel() for tensor in tensor_list])
-    for i in range(sub_partition_count):
-        padding = get_alignment_padding(flattened_size, i, sub_partition_size)
-        group_paddings.append(padding)
-
-    return group_paddings
-
-
-def _single_range_check(current_index, start_index, end_index, tensor_size):
-    offset = 0
-    if (current_index >= start_index) and (current_index < end_index):
-        # Fully inside bounds
-        return True, offset
-    elif (start_index > current_index) and (start_index < (current_index + tensor_size)):
-        # Partially contained, compute offset
-        offset = start_index - current_index
-        return True, offset
-    else:
-        return False, offset
-
-
-def _range_check(current_index, element_intervals, tensor_size):
-    results = []
-    for comm_idx, interval in enumerate(element_intervals):
-        start_index, end_index = interval
-        contained, offset = _single_range_check(current_index, start_index, end_index, tensor_size)
-        if contained:
-            results.append((contained, offset, comm_idx))
-    if len(results) == 0:
-        return [(False, 0, -1)]
-    return results
-
-
-def move_to_cpu(tensor_list):
-    for tensor in tensor_list:
-        tensor.data = tensor.data.cpu()
-
-
-def get_grad_norm(gradients, parameters, norm_type=2, mpu=None):
-    norm_type = float(norm_type)
-    if norm_type == inf:
-        total_norm = max(g.data.abs().max() for g in gradients)
-        total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
-        # # Take max across all GPUs.
-        torch.distributed.all_reduce(total_norm_cuda,
-                                     op=torch.distributed.ReduceOp.MAX,
-                                     group=mpu.get_data_parallel_group())
-
-        if mpu.get_model_parallel_group is not None and mpu.get_model_parallel_world_size() != 1:
-            torch.distributed.all_reduce(total_norm_cuda,
-                                         op=torch.distributed.ReduceOp.SUM,
-                                         group=mpu.get_model_parallel_group())
-
-        total_norm = total_norm_cuda[0].item()
-    else:
-        total_norm = 0.
-        tensor_mp_rank = bwc_tensor_model_parallel_rank(mpu=mpu)
-        for g, p in zip(gradients, parameters):
-            # Pipeline parallelism may replicate parameters. Avoid multi-counting.
-            if hasattr(p, 'ds_pipe_replicated') and p.ds_pipe_replicated:
-                continue
-
-            # Filter to avoid over-counting replicated tensors from tensor
-            # model parallelism
-            if tensor_mp_rank > 0:
-                continue
-
-            # if is_model_parallel_parameter(p) or (tensor_mp_rank  == 0):
-            param_norm = g.data.double().norm(norm_type)
-            total_norm += param_norm.item() ** norm_type
-
-        # Sum across all model parallel GPUs.
-        total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
-
-        torch.distributed.all_reduce(total_norm_cuda,
-                                     op=torch.distributed.ReduceOp.SUM,
-                                     group=mpu.get_data_parallel_group())
-
-        if mpu.get_model_parallel_group is not None and mpu.get_model_parallel_world_size() != 1:
-            torch.distributed.all_reduce(total_norm_cuda,
-                                         op=torch.distributed.ReduceOp.SUM,
-                                         group=mpu.get_model_parallel_group())
-
-        total_norm = total_norm_cuda[0].item() ** (1. / norm_type)
-
-    if total_norm == float(
-            'inf') or total_norm == -float('inf') or total_norm != total_norm:
-        total_norm = -1
-
-    return total_norm
-
-
-def bwc_tensor_model_parallel_rank(mpu=None):
-    """Backwards-compatible way of querying the tensor model parallel rank from
-    an ``mpu`` object.
-
-    *Tensor* model parallelism means that tensors are physically split across
-    processes. This contrasts with *pipeline* model parallelism, in which the
-    layers are partitioned but tensors left intact.
-
-    The API for tensor model parallelism has changed across versions and this
-    helper provides a best-effort implementation across versions of ``mpu``
-    objects.  The preferred mechanism is
-    ``mpu.get_tensor_model_parallel_rank()``.
-
-    This should "just work" with both Megatron-LM and DeepSpeed's pipeline
-    parallelism.
-
-    Args:
-        mpu (model parallel unit, optional): The tensor model parallel rank.
-            If ``mpu=None``, returns 0. Defaults to ``None``.
-
-    Returns:
-        int: the rank
-    """
-    if mpu is None:
-        # No model parallelism in easy :)
-        return 0
-
-    if hasattr(mpu, 'get_tensor_model_parallel_rank'):
-        # New Megatron and DeepSpeed convention (post pipeline-parallelism release)
-        return mpu.get_tensor_model_parallel_rank()
-    elif hasattr(mpu, 'get_slice_parallel_rank'):
-        # Some DeepSpeed + pipeline parallelism versions
-        return mpu.get_slice_parallel_rank()
-    else:
-        # Deprecated Megatron and DeepSpeed convention
-        return mpu.get_model_parallel_rank()
-
-
-class LossScalerBase:
-    """LossScalarBase
-    Base class for a loss scaler
-    """
-
-    def __init__(self, cur_scale):
-        self.cur_scale = cur_scale
-
-    @property
-    def loss_scale(self):
-        return self.cur_scale
-
-    def scale_gradient(self, module, grad_in, grad_out):
-        return tuple(self.loss_scale * g for g in grad_in)
-
-    def update_scale(self, overflow):
-        pass
-
-    def backward(self, loss, retain_graph=False):
-        scaled_loss = loss * self.loss_scale
-        scaled_loss.backward(retain_graph=retain_graph)
-
-
-class LossScaler(LossScalerBase):
-    """
-    Class that manages a static loss scale.  This class is intended to interact with
-    :class:`FP16_Optimizer`, and should not be directly manipulated by the user.
-
-    Use of :class:`LossScaler` is enabled via the ``static_loss_scale`` argument to
-    :class:`FP16_Optimizer`'s constructor.
-
-    Args:
-        scale (float, optional, default=1.0):  The loss scale.
-    """
-
-    def __init__(self, scale=1):
-        super(LossScaler, self).__init__(scale)
-
-    # `params` is a list / generator of torch.Variable
-    def has_overflow(self, params):
-        return False
-
-    # `x` is a torch.Tensor
-    def _has_inf_or_nan(x):
-        return False
-
-
-class DynamicLossScaler(LossScalerBase):
-    """
-    Class that manages dynamic loss scaling.  It is recommended to use :class:`DynamicLossScaler`
-    indirectly, by supplying ``dynamic_loss_scale=True`` to the constructor of
-    :class:`FP16_Optimizer`.  However, it's important to understand how :class:`DynamicLossScaler`
-    operates, because the default options can be changed using the
-    the ``dynamic_loss_args`` argument to :class:`FP16_Optimizer`'s constructor.
-
-    Loss scaling is designed to combat the problem of underflowing gradients encountered at long
-    times when training fp16 networks.  Dynamic loss scaling begins by attempting a very high loss
-    scale.  Ironically, this may result in OVERflowing gradients.  If overflowing gradients are
-    encountered, :class:`DynamicLossScaler` informs :class:`FP16_Optimizer` that an overflow has
-    occurred.
-    :class:`FP16_Optimizer` then skips the update step for this particular iteration/minibatch,
-    and :class:`DynamicLossScaler` adjusts the loss scale to a lower value.
-    If a certain number of iterations occur without overflowing gradients detected,
-    :class:`DynamicLossScaler` increases the loss scale once more.
-    In this way :class:`DynamicLossScaler` attempts to "ride the edge" of
-    always using the highest loss scale possible without incurring overflow.
-
-    Args:
-        init_scale (float, optional, default=2**32):  Initial loss scale attempted by :class:`DynamicLossScaler.`
-        scale_factor (float, optional, default=2.0):  Factor used when adjusting the loss scale. If an overflow is encountered, the loss scale is readjusted to loss scale/``scale_factor``.  If ``scale_window`` consecutive iterations take place without an overflow, the loss scale is readjusted to loss_scale*``scale_factor``.
-        scale_window (int, optional, default=1000):  Number of consecutive iterations without an overflow to wait before increasing the loss scale.
-    """
-
+class DeepSpeedZeroOptimizer(object):
     def __init__(self,
-                 init_scale=2 ** 32,
-                 scale_factor=2.,
-                 scale_window=1000,
-                 min_scale=1,
-                 delayed_shift=1,
-                 consecutive_hysteresis=False):
-        super(DynamicLossScaler, self).__init__(init_scale)
-        self.cur_iter = 0
-        self.last_overflow_iter = -1
-        self.scale_factor = scale_factor
-        self.scale_window = scale_window
-        self.min_scale = min_scale
-        self.delayed_shift = delayed_shift
-        self.cur_hysteresis = delayed_shift
-        self.consecutive_hysteresis = consecutive_hysteresis
+                 init_optimizer,
+                 param_names,
+                 static_loss_scale=1.0,
+                 dynamic_loss_scale=False,
+                 dynamic_loss_args=None,
+                 verbose=True,
+                 contiguous_gradients=True,
+                 reduce_bucket_size=500000000,
+                 use_multi_rank_bucket_allreduce=True,
+                 allgather_bucket_size=5000000000,
+                 dp_process_group=None,
+                 expert_parallel_group=None,
+                 expert_data_parallel_group=None,
+                 reduce_scatter=True,
+                 overlap_comm=False,
+                 offload_optimizer_config=None,
+                 mpu=None,
+                 clip_grad=0.0,
+                 gradient_accumulation_dtype=torch.float32,
+                 communication_data_type=torch.float16,
+                 postscale_gradients=True,
+                 gradient_predivide_factor=1.0,
+                 gradient_accumulation_steps=1,
+                 ignore_unused_parameters=True,
+                 partition_grads=True,
+                 round_robin_gradients=False,
+                 has_moe_layers=False,
+                 fp16_master_weights_and_gradients=False,
+                 elastic_checkpoint=False):
 
-    # `params` is a list / generator of torch.Variable
-    def has_overflow_serial(self, params):
+        self.cpu_offload = True
+        self.cpu_offload_pin_memory = False
+        self.elastic_checkpoint = elastic_checkpoint
+        self.param_names = param_names
+        self.mpu = mpu
+        self.optimizer = init_optimizer
+        self.flatten = _flatten_dense_tensors
+        self.unflatten = _unflatten_dense_tensors
+        self.partition_gradients = partition_grads
+        self.zero_stage_string = "ZeRO-2"
+        self.reduce_scatter = reduce_scatter
+        self.overlap_comm = overlap_comm
+        self.deepspeed_adam_offload = True
+        self.device = 'cpu'
+        self.dp_process_group = dp_process_group
+        self.sequence_parallel_size = 1
+        self.ep_process_group = expert_parallel_group
+        self.expert_dp_process_group = expert_data_parallel_group
+        dp_size = dist.get_world_size(group=self.dp_process_group)
+        self.real_dp_process_group = [dp_process_group for i in range(len(self.optimizer.param_groups))]
+        self.partition_count = [dp_size for i in range(len(self.optimizer.param_groups))]
+        self.is_gradient_accumulation_boundary = True
+        self.contiguous_gradients = contiguous_gradients or self.cpu_offload
+        self.has_moe_layers = has_moe_layers
+        self._global_grad_norm = 0.
+        self.model_parallel_group = None
+        self.model_parallel_world_size = 1
+        self.model_parallel_rank = 0
+        self.overflow = False
+        self.clip_grad = clip_grad
+        self.communication_data_type = communication_data_type
+        self.gradient_predivide_factor = gradient_predivide_factor
+        self.postscale_gradients = postscale_gradients
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.micro_step_id = 0
+        self.ignore_unused_parameters = ignore_unused_parameters
+        self.round_robin_gradients = round_robin_gradients
+        self.extra_large_param_to_reduce = None
+        self.fp16_master_weights_and_gradients = fp16_master_weights_and_gradients
+        self.bit16_groups = []
+        self.bit16_groups_flat = []
+        self.parallel_partitioned_bit16_groups = []
+        self.single_partition_of_fp32_groups = []
+        self.params_not_in_partition = []
+        self.params_in_partition = []
+        self.first_offset = []
+        self.partition_size = []
+        self.nccl_start_alignment_factor = 2
+        self.all_reduce_print = False
+        self.dtype = self.optimizer.param_groups[0]['params'][0].dtype
+        self.gradient_accumulation_dtype = gradient_accumulation_dtype
+        self.use_separate_grad_accum = False
+        self.use_grad_accum_attribute = False
+        self.round_robin_bit16_groups = []
+        self.round_robin_bit16_indices = []
+        self.round_robin_bit16_meta = []
+        self.groups_padding = []
+        self.ipg_index = 0
+
+        for i, param_group in enumerate(self.optimizer.param_groups):
+            partition_id = dist.get_rank(group=self.real_dp_process_group[i])
+            trainable_parameters = []
+            for param in param_group['params']:
+                if param.requires_grad:
+                    param.grad_accum = None
+                    trainable_parameters.append(param)
+            self.bit16_groups.append(trainable_parameters)
+            orig_group_numel = 0
+            for param in self.bit16_groups[i]:
+                orig_group_numel += param.numel()
+                param.cpu_data = param.data.cpu()
+                param.data = torch.empty(1).to(param.device)
+
+            move_to_cpu(self.bit16_groups[i])
+            empty_cache()
+
+            round_robin_tensors = self.bit16_groups[i]
+            round_robin_indices = list(range(len(self.bit16_groups[i])))
+
+            self.round_robin_bit16_groups.append(round_robin_tensors)
+            self.round_robin_bit16_indices.append(round_robin_indices)
+            meta_tensors = []
+            for param in round_robin_tensors:
+                meta_tensors.append(torch.zeros_like(param.cpu_data, device="meta"))
+            self.round_robin_bit16_meta.append(meta_tensors)
+            flattened_buffer = self.flatten_dense_tensors_aligned(
+                self.round_robin_bit16_groups[i],
+                self.nccl_start_alignment_factor * dist.get_world_size(group=self.real_dp_process_group[i]))
+            for param in self.bit16_groups[i]:
+                del param.cpu_data
+            self.bit16_groups_flat.append(flattened_buffer.to('cuda:{}'.format(torch.cuda.current_device())))
+            del flattened_buffer
+            if partition_id == dist.get_world_size(group=self.real_dp_process_group[i]) - 1:
+                padding = self.bit16_groups_flat[i].numel() - orig_group_numel
+            else:
+                padding = 0
+
+            self.groups_padding.append(padding)
+
+            self._update_model_bit16_weights(i)
+
+            data_parallel_partitions = self.get_data_parallel_partitions(self.bit16_groups_flat[i], i)
+            self.parallel_partitioned_bit16_groups.append(data_parallel_partitions)
+
+            weights_partition = self.parallel_partitioned_bit16_groups[i][partition_id].to(
+                self.device).clone().float().detach()
+
+            weights_partition = weights_partition.pin_memory()
+
+            self.single_partition_of_fp32_groups.append(weights_partition)
+            self.single_partition_of_fp32_groups[i].requires_grad = True
+            param_group['params'] = [self.single_partition_of_fp32_groups[i]]
+            partition_size = len(self.bit16_groups_flat[i]) / dist.get_world_size(group=self.real_dp_process_group[i])
+            params_in_partition, params_not_in_partition, first_offset = self.get_partition_info(
+                self.round_robin_bit16_groups[i], partition_size, partition_id)
+            self.partition_size.append(partition_size)
+            self.params_in_partition.append(params_in_partition)
+            self.params_not_in_partition.append(params_not_in_partition)
+            self.first_offset.append(first_offset)
+        self.reduce_bucket_size = int(reduce_bucket_size)
+        self.use_multi_rank_bucket_allreduce = use_multi_rank_bucket_allreduce
+        self.allgather_bucket_size = int(allgather_bucket_size)
+
+        self.reduction_stream = torch.cuda.Stream
+        self.callback_queued = False
+        self.param_dict = {}
+        self.is_param_in_current_partition = {}
+        self.grads_in_ipg_bucket = []
+        self.params_in_ipg_bucket = []
+        self.elements_in_ipg_bucket = 0
+        self.params_already_reduced = []
+        self._release_ipg_buffers()
+        self.previous_reduced_grads = None
+        self.ipg_bucket_has_moe_params = False
+        self.param_id = {}
+
+        largest_param_numel = 0
+        count = 0
+        for i, params_group in enumerate(self.bit16_groups):
+            for param in params_group:
+                unique_id = id(param)
+                self.param_id[unique_id] = count
+                self.param_dict[count] = param
+                self.params_already_reduced.append(False)
+                if param.numel() > largest_param_numel:
+                    largest_param_numel = param.numel()
+                count = count + 1
+
+        for param_group in self.params_in_partition:
+            for param in param_group:
+                self.is_param_in_current_partition[self.get_param_id(param)] = True
+
+        for param_group in self.params_not_in_partition:
+            for param in param_group:
+                self.is_param_in_current_partition[self.get_param_id(param)] = False
+
+        self.accumulated_grads_in_cpu = {}
+        self.norm_for_param_grads = {}
+        self.local_overflow = False
+        self.grad_position = {}
+        self.temp_grad_buffer_for_cpu_offload = torch.zeros(largest_param_numel,
+                                                            device=self.device,
+                                                            dtype=self.dtype)
+        self.temp_grad_buffer_for_gpu_offload = torch.zeros(largest_param_numel,
+                                                            device='cuda:{}'.format(torch.cuda.current_device()),
+                                                            dtype=self.dtype)
+        for i, params_group in enumerate(self.bit16_groups):
+            self.get_grad_position(i, self.params_in_partition[i], self.first_offset[i], self.partition_size[i])
+
+        self.param_to_partition_ids = {}
+        self.is_partition_reduced = {}
+        self.remaining_grads_in_partition = {}
+        self.total_grads_in_partition = {}
+        self.is_grad_computed = {}
+        self.grad_partition_insertion_offset = {}
+        self.grad_start_offset = {}
+        self.averaged_gradients = {}
+        self.offload_gradient_dict = {}
+        self.first_param_index_in_partition = {}
+        self.initialize_gradient_partitioning_data_structures()
+        self.reset_partition_gradient_structures()
+        self._grad_acc_hooks = []
+        self.grad_accs = []
+        self.create_reduce_and_remove_grad_hooks()
+        self.custom_loss_scaler = False
+        self.external_loss_scale = None
+        self.loss_scaler = CreateLossScaler(dtype=self.dtype,
+                                            static_loss_scale=static_loss_scale,
+                                            dynamic_scaling=dynamic_loss_scale,
+                                            dynamic_loss_args=dynamic_loss_args)
+        self.dynamic_loss_scale = self.loss_scaler.dynamic
+
+        self.initialize_optimizer_states()
+
+        self._link_all_hp_params()
+        self._hp_optimizer_states_linked = False
+
+        self._enable_universal_checkpoint()
+        self._param_slice_mappings = self._create_param_mapping()
+
+    def _update_model_bit16_weights(self, group_index):
+        updated_params = self.unflatten(self.bit16_groups_flat[group_index],
+                                        self.round_robin_bit16_groups[group_index])
+        for p, q in zip(self.round_robin_bit16_groups[group_index], updated_params):
+            p.data = q.data
+
+        # set model fp16 weight to slices of reordered flattened buffer
+        for param_index, param in enumerate(self.bit16_groups[group_index]):
+            new_index = self.round_robin_bit16_indices[group_index][param_index]
+            # noinspection PyUnresolvedReferences
+            param.data = self.round_robin_bit16_groups[group_index][new_index].data
+
+    def get_data_parallel_partitions(self, tensor, group_id):
+        partitions = []
+
+        dp = dist.get_world_size(group=self.real_dp_process_group[group_id])
+        # dp_id = dist.get_rank(group=self.real_dp_process_group[group_id])
+
+        total_num_elements = tensor.numel()
+
+        base_size = total_num_elements // dp
+        remaining = total_num_elements % dp
+
+        start = 0
+        for ids in range(dp):
+            partition_size = base_size
+            if ids < remaining:
+                partition_size = partition_size + 1
+            partitions.append(tensor.narrow(0, start, partition_size))
+            start = start + partition_size
+        return partitions
+
+    def get_partition_info(self, tensor_list, partition_size, partition_id):
+        params_in_partition = []
+        params_not_in_partition = []
+
+        start_index = partition_size * partition_id
+        end_index = partition_size * (partition_id + 1)
+
+        current_index = 0
+        first_offset = 0
+
+        for tensor in tensor_list:
+            tensor_size = tensor.numel()
+            if start_index <= current_index < end_index:
+                params_in_partition.append(tensor)
+            elif current_index < start_index < (current_index + tensor_size):
+                params_in_partition.append(tensor)
+                first_offset = start_index - current_index
+            else:
+                params_not_in_partition.append(tensor)
+            current_index = current_index + tensor_size
+        return params_in_partition, params_not_in_partition, first_offset
+
+    def _release_ipg_buffers(self):
+        self.ipg_buffer = None
+        self.grads_in_partition = None
+        self.grads_in_partition_offset = 0
+
+    def get_grad_position(self, group_id, tensor_list, first_offset, partition_size):
+        current_offset = 0
+
+        for i, tensor in enumerate(tensor_list):
+            param_id = self.get_param_id(tensor)
+            param_start_offset = 0
+
+            num_elements = tensor.numel()
+
+            if i == 0 and first_offset > 0:
+                tensor_offset = first_offset
+                num_elements = num_elements - tensor_offset
+                param_start_offset = first_offset
+
+            if num_elements > (partition_size - current_offset):
+                num_elements = partition_size - current_offset
+
+            self.grad_position[param_id] = [
+                int(group_id), int(param_start_offset),
+                int(current_offset), int(num_elements)
+            ]
+            current_offset += num_elements
+
+    def initialize_gradient_partitioning_data_structures(self):
+
+        for i, param_group in enumerate(self.round_robin_bit16_groups):
+            total_partitions = dist.get_world_size(group=self.real_dp_process_group[i])
+
+            self.param_to_partition_ids[i] = {}
+            self.is_partition_reduced[i] = {}
+            self.total_grads_in_partition[i] = {}
+            self.remaining_grads_in_partition[i] = {}
+            self.is_grad_computed[i] = {}
+            self.grad_partition_insertion_offset[i] = {}
+            self.grad_start_offset[i] = {}
+            self.first_param_index_in_partition[i] = {}
+
+            for partition_id in range(total_partitions):
+                self.is_grad_computed[i][partition_id] = {}
+                self.grad_partition_insertion_offset[i][partition_id] = {}
+                self.grad_start_offset[i][partition_id] = {}
+                self.total_grads_in_partition[i][partition_id] = 0
+                self.initialize_gradient_partition(i, param_group, partition_id)
+                self.is_partition_reduced[i][partition_id] = False
+                self.first_param_index_in_partition[i][partition_id] = self.get_first_param_index(
+                    i, param_group, partition_id)
+
+    def initialize_gradient_partition(self, i, param_group, partition_id):
+
+        def set_key_value_list(dictionary, key, value):
+            if key in dictionary:
+                dictionary[key].append(value)
+            else:
+                dictionary[key] = [value]
+
+        def increment_value(dictionary, key):
+            if key in dictionary:
+                dictionary[key] += 1
+            else:
+                dictionary[key] = 1
+
+        partition_size = self.partition_size[i]
+
+        start_index = partition_size * partition_id
+        end_index = partition_size * (partition_id + 1)
+
+        current_index = 0
+        first_offset = 0
+
+        for param in param_group:
+
+            param_size = param.numel()
+            param_id = self.get_param_id(param)
+
+            if start_index <= current_index < end_index:
+                set_key_value_list(self.param_to_partition_ids[i], param_id, partition_id)
+                increment_value(self.total_grads_in_partition[i], partition_id)
+
+                self.is_grad_computed[i][partition_id][param_id] = False
+
+                self.grad_partition_insertion_offset[i][partition_id][param_id] = current_index - start_index
+                self.grad_start_offset[i][partition_id][param_id] = 0
+
+            elif current_index < start_index < (current_index + param_size):
+                first_offset = start_index - current_index
+
+                set_key_value_list(self.param_to_partition_ids[i], param_id, partition_id)
+                increment_value(self.total_grads_in_partition[i], partition_id)
+
+                self.is_grad_computed[i][partition_id][param_id] = False
+
+                self.grad_partition_insertion_offset[i][partition_id][param_id] = 0
+                self.grad_start_offset[i][partition_id][param_id] = first_offset
+
+            current_index = current_index + param_size
+
+    def get_first_param_index(self, group_id, param_group, partition_id):
+        for index, param in enumerate(param_group):
+            param_id = self.get_param_id(param)
+            if partition_id in self.param_to_partition_ids[group_id][param_id]:
+                return index
+        return None
+
+    def get_param_id(self, param):
+        unique_id = id(param)
+        return self.param_id[unique_id]
+
+    def reset_partition_gradient_structures(self):
+        for i, _ in enumerate(self.bit16_groups):
+            total_partitions = dist.get_world_size(group=self.real_dp_process_group[i])
+            for partition_id in range(total_partitions):
+                self.is_partition_reduced[i][partition_id] = False
+                self.remaining_grads_in_partition[i][partition_id] = self.total_grads_in_partition[i][partition_id]
+
+                for param_id in self.is_grad_computed[i][partition_id]:
+                    self.is_grad_computed[i][partition_id][param_id] = False
+
+    def create_reduce_and_remove_grad_hooks(self):
+        for i, param_group in enumerate(self.bit16_groups):
+            for param in param_group:
+                if param.requires_grad:
+                    def wrapper(param, i):
+                        param_tmp = param.expand_as(param)
+                        grad_acc = param_tmp.grad_fn.next_functions[0][0]
+
+                        def reduce_partition_and_remove_grads(*notneeded):
+                            self.reduce_ready_partitions_and_remove_grads(param, i)
+
+                        self._grad_acc_hooks.append(grad_acc.register_hook(reduce_partition_and_remove_grads))
+                        self.grad_accs.append(grad_acc)
+
+                    wrapper(param, i)
+
+    def reduce_ready_partitions_and_remove_grads(self, param, i):
+        if self.partition_gradients or self.is_gradient_accumulation_boundary:
+            self.reduce_independent_p_g_buckets_and_remove_grads(param, i)
+
+    def reduce_independent_p_g_buckets_and_remove_grads(self, param, i):
+
+        grad_reduc = self.get_gradient_for_reduction(param)
+
+        param_id = self.get_param_id(param)
+
+        new_grad_tensor = self.ipg_buffer[self.ipg_index].narrow(0, self.elements_in_ipg_bucket, param.numel())
+        new_grad_tensor.copy_(grad_reduc.view(-1))
+        grad_reduc.data = new_grad_tensor.data.view_as(grad_reduc)
+
+        self.elements_in_ipg_bucket += param.numel()
+        self.grads_in_ipg_bucket.append(grad_reduc)
+        self.params_in_ipg_bucket.append((i, param, param_id))
+
+    def get_gradient_for_reduction(self, param):
+        if self.use_grad_accum_attribute:
+            return param.grad_accum.to(self.dtype) if param.grad_accum is not None else None
+        else:
+            return param.grad
+
+    def flatten_dense_tensors_aligned(self, tensor_list, alignment):
+        return self.flatten(align_dense_tensors(tensor_list, alignment))
+
+    def initialize_optimizer_states(self):
+
+        for i, group in enumerate(self.bit16_groups):
+            single_grad_partition = torch.zeros(int(self.partition_size[i]),
+                                                dtype=self.single_partition_of_fp32_groups[i].dtype,
+                                                device=self.device)
+            self.single_partition_of_fp32_groups[i].grad = single_grad_partition
+        if isinstance(self.optimizer, torch.optim.Adagrad):
+            self.optimizer = torch.optim.Adagrad(self.single_partition_of_fp32_groups, **self.optimizer.defaults)
+        else:
+            self.optimizer.step()
+
+        return
+
+    def _get_offload_gradient_dict(self):
+        for param_group_index, _ in enumerate(self.optimizer.param_groups):
+            self.offload_gradient_dict[param_group_index] = []
+            for lp_param in self.params_in_partition[param_group_index]:
+                param_id = self.get_param_id(lp_param)
+                [_, _, dest_offset, num_elements] = self.grad_position[param_id]
+                dest_tensor = self.single_partition_of_fp32_groups[param_group_index].grad.view(-1).narrow(
+                    0, dest_offset, num_elements)
+                self.offload_gradient_dict[param_group_index].append(dest_tensor)
+
+    def _link_all_hp_params(self):
+        dp_world_size = dist.get_world_size(group=self.dp_process_group)
+        self._get_offload_gradient_dict()
+
+        for i, _ in enumerate(self.optimizer.param_groups):
+            partition_id = dist.get_rank(group=self.real_dp_process_group[i])
+            partition_size = self.bit16_groups_flat[i].numel() // dp_world_size
+            flat_hp_partition = self.single_partition_of_fp32_groups[i]
+            link_hp_params(lp_param_list=self.bit16_groups[i],
+                           flat_hp_partition=flat_hp_partition,
+                           gradient_dict=self.averaged_gradients,
+                           offload_gradient_dict=self.offload_gradient_dict,
+                           use_offload=self.cpu_offload,
+                           param_group_index=i,
+                           partition_start=partition_id * partition_size,
+                           partition_size=partition_size,
+                           partition_optimizer_state=self.optimizer.state[flat_hp_partition],
+                           dp_group=self.real_dp_process_group[i])
+
+    def _enable_universal_checkpoint(self):
+        for lp_param_group in self.bit16_groups:
+            enable_universal_checkpoint(param_list=lp_param_group)
+
+    def _create_param_mapping(self):
+        param_mapping = []
+        for i, _ in enumerate(self.optimizer.param_groups):
+            param_mapping_per_group = OrderedDict()
+            for lp in self.bit16_groups[i]:
+                if lp._hp_mapping is not None:
+                    lp_name = self.param_names[lp]
+                    param_mapping_per_group[lp_name] = lp._hp_mapping.get_hp_fragment_address()
+            param_mapping.append(param_mapping_per_group)
+
+        return param_mapping
+
+    def allreduce_bucket(self, bucket, rank=None, log=None, divide=True, process_group=None):
+        rank = None
+        tensor = self.flatten(bucket)
+
+        process_group = self.dp_process_group if process_group is None else process_group
+
+        tensor_to_allreduce = tensor
+
+        if pg_correctness_test or self.sequence_parallel_size > 1:
+            communication_data_type = torch.float32
+        else:
+            communication_data_type = self.communication_data_type
+
+        if communication_data_type != tensor.dtype:
+            tensor_to_allreduce = tensor.to(communication_data_type)
+
+        if divide:
+            tensor_to_allreduce.div_(dist.get_world_size(group=process_group) / float(self.sequence_parallel_size))
+
+        if rank is None:
+            #    "All Reducing"
+            dist.all_reduce(tensor_to_allreduce, group=process_group)
+        else:
+            global_rank = dist.get_rank(process_group)
+            dist.reduce(tensor_to_allreduce, global_rank, group=process_group)
+
+        if communication_data_type != tensor.dtype and tensor is not tensor_to_allreduce:
+            if rank is None or rank == dist.get_rank(group=process_group):
+                tensor.copy_(tensor_to_allreduce)
+
+        return tensor
+
+    def allreduce_and_copy_with_multiple_ranks(self,
+                                               small_bucket,
+                                               log=None,
+                                               divide=True,
+                                               process_group=None,
+                                               bucket_ranks=None):
+        process_group = self.dp_process_group if process_group is None else process_group
+        allreduced = self.allreduce_bucket(small_bucket, log=log, divide=divide, process_group=process_group)
+        for buf, synced, bucket_rank in zip(small_bucket, self.unflatten(allreduced, small_bucket), bucket_ranks):
+            if dist.get_rank(group=process_group) == bucket_rank:
+                buf.copy_(synced)
+
+    def allreduce_and_scatter(self, bucket, numel_per_bucket=500000000, log=None, divide=True, process_group=None):
+        small_bucket = []
+        small_bucket_ranks = []
+        numel = 0
+        allreduce_sizes = []
+
+        for i, bucket_elem in enumerate(bucket):
+            rank, tensor = bucket_elem
+            small_bucket.append(tensor)
+            small_bucket_ranks.append(rank)
+            numel = numel + tensor.numel()
+            if numel > numel_per_bucket:
+                self.allreduce_and_copy_with_multiple_ranks(small_bucket,
+                                                            log=None,
+                                                            divide=divide,
+                                                            process_group=process_group,
+                                                            bucket_ranks=small_bucket_ranks)
+                small_bucket = []
+                small_bucket_ranks = []
+                numel = 0
+
+        if len(small_bucket) > 0:
+            self.allreduce_and_copy_with_multiple_ranks(small_bucket,
+                                                        log=None,
+                                                        divide=divide,
+                                                        process_group=process_group,
+                                                        bucket_ranks=small_bucket_ranks)
+
+    def average_tensor(self, tensor):
+        stream = self.reduction_stream
+        stream.wait_stream(torch.cuda.current_stream(None))
+        with torch.cuda.stream(stream):
+            rank_and_offsets = []
+            real_dp_process_group = []
+            curr_size = 0
+            prev_id, prev_process_group = -1, None
+            process_group = self.dp_process_group
+            for i, param, param_id in self.params_in_ipg_bucket:
+                process_group = self.dp_process_group
+                grad_reduc = self.get_gradient_for_reduction(param)
+                if self.ipg_bucket_has_moe_params:
+                    process_group = self.expert_dp_process_group[param.group_name] if is_moe_param(
+                        param) else self.dp_process_group
+                    grad_reduc.data.div_(dist.get_world_size(group=process_group) / float(self.sequence_parallel_size))
+
+                partition_ids = self.param_to_partition_ids[i][param_id]
+                partition_size = self.partition_size[i]
+                partition_ids_w_offsets = []
+                for partition_id in partition_ids:
+                    offset = self.grad_start_offset[i][partition_id][param_id]
+                    partition_ids_w_offsets.append((partition_id, offset))
+                partition_ids_w_offsets.sort(key=lambda t: t[1])
+                for idx in range(len(partition_ids_w_offsets)):
+                    partition_id, offset = partition_ids_w_offsets[idx]
+                    if idx == len(partition_ids_w_offsets) - 1:
+                        numel = param.numel() - offset
+                    else:
+                        numel = partition_ids_w_offsets[idx + 1][1] - offset
+
+                    if partition_id == prev_id and process_group == prev_process_group:
+                        prev_pid, prev_size, prev_numel = rank_and_offsets[-1]
+                        rank_and_offsets[-1] = (prev_pid, prev_size, prev_numel + numel)
+                    else:
+                        rank_and_offsets.append((partition_id, curr_size, numel))
+                        real_dp_process_group.append(process_group)
+                    curr_size += numel
+                    prev_id, prev_process_group = partition_id, process_group
+            tensor.div_(dist.get_world_size(group=self.dp_process_group) / float(self.sequence_parallel_size))
+            buckets = {}
+            for i, (dst, bucket_offset, numel) in enumerate(rank_and_offsets):
+                grad_slice = tensor.narrow(0, int(bucket_offset), int(numel))
+                bucket_key = real_dp_process_group[i] if self.use_multi_rank_bucket_allreduce else (
+                    dst, real_dp_process_group[i])
+                if bucket_key not in buckets:
+                    buckets[bucket_key] = []
+                if self.use_multi_rank_bucket_allreduce:
+                    buckets[bucket_key].append((dst, grad_slice))
+                else:
+                    buckets[bucket_key].append(grad_slice)
+
+            for bucket_key in buckets:
+                self.allreduce_and_scatter(buckets[bucket_key],
+                                           numel_per_bucket=self.reduce_bucket_size,
+                                           divide=self.ipg_bucket_has_moe_params,
+                                           process_group=bucket_key)
+
+    def clear_grad_attribute(self, param):
+        if self.use_grad_accum_attribute:
+            param.grad_accum = None
+        else:
+            param.grad = None
+
+    def get_param_gradient_attribute(self, param):
+        return param.grad_accum if self.use_grad_accum_attribute else param.grad
+
+    def async_accumulate_grad_in_cpu_via_gpu(self, param):
+        param_id = self.get_param_id(param)
+        [i, source_offset, dest_offset, num_elements] = self.grad_position[param_id]
+
+        dest_buffer = self.temp_grad_buffer_for_gpu_offload.view(-1).narrow(0, 0, param.numel())
+
+        def buffer_to_accumulate_to_in_cpu():
+            buffer = torch.zeros(param.numel(), dtype=param.dtype, device=self.device)
+            return buffer.pin_memory() if self.cpu_offload_pin_memory else buffer
+
+        def accumulate_gradients():
+            grad_accum = self.get_param_gradient_attribute(param)
+            dest_buffer.copy_(self.accumulated_grads_in_cpu[param_id].view(-1), non_blocking=True)
+            grad_accum.data.view(-1).add_(dest_buffer)
+
+        def copy_gradients_to_cpu():
+            grad_accum = self.get_param_gradient_attribute(param)
+            self.accumulated_grads_in_cpu[param_id].data.copy_(grad_accum.data.view(-1), non_blocking=True)
+
+        if param_id not in self.accumulated_grads_in_cpu:
+            self.accumulated_grads_in_cpu[param_id] = buffer_to_accumulate_to_in_cpu()
+
+        if self.micro_step_id > 0:
+            accumulate_gradients()
+
+        if not self.is_gradient_accumulation_boundary:
+            copy_gradients_to_cpu()
+
+    def set_norm_for_param_grad_in_gpu(self, param):
+        param_id = self.get_param_id(param)
+        grad_accum = self.get_param_gradient_attribute(param)
+        if grad_accum is None:
+            accumulated_grad = param.grad
+        else:
+            accumulated_grad = grad_accum
+
+        [i, source_offset, dest_offset, num_elements] = self.grad_position[param_id]
+
+        start = source_offset
+        accumulated_grad = accumulated_grad.view(-1).narrow(0, start, num_elements)
+
+        self.norm_for_param_grads[param_id] = accumulated_grad.data.double().norm(2)
+
+    @staticmethod
+    def _has_inf_or_nan(x, j=None):
+        try:
+            cpu_sum = float(x.float().sum())
+        except RuntimeError as instance:
+
+            if "value cannot be converted" not in instance.args[0]:
+                raise
+            return True
+        else:
+            if cpu_sum == float('inf') or cpu_sum == -float('inf') or cpu_sum != cpu_sum:
+                return True
+            return False
+
+    def update_overflow_tracker_for_param_grad(self, param):
+        grad_accum = self.get_param_gradient_attribute(param)
+        if grad_accum is not None and self._has_inf_or_nan(grad_accum.data):
+            self.local_overflow = True
+
+    def async_inplace_copy_grad_to_fp32_buffer_from_gpu(self, param):
+        param_id = self.get_param_id(param)
+
+        [i, source_offset, dest_offset, num_elements] = self.grad_position[param_id]
+
+        dest_tensor = self.single_partition_of_fp32_groups[i].grad.view(-1).narrow(0, dest_offset, num_elements)
+
+        grad_accum = self.get_param_gradient_attribute(param)
+
+        if grad_accum is None:
+            src_tensor = grad_accum.view(-1).narrow(0, source_offset, num_elements)
+        else:
+            src_tensor = grad_accum.view(-1).narrow(0, source_offset, num_elements)
+        if not self.fp16_master_weights_and_gradients:
+            src_tensor = src_tensor.float()
+
+        dest_tensor.copy_(src_tensor, non_blocking=True)
+        param.grad = None
+
+    def copy_grads_in_partition(self, param):
+        self.async_accumulate_grad_in_cpu_via_gpu(param)
+
+        if self.is_gradient_accumulation_boundary:
+            self.set_norm_for_param_grad_in_gpu(param)
+            self.update_overflow_tracker_for_param_grad(param)
+            self.async_inplace_copy_grad_to_fp32_buffer_from_gpu(param)
+
+    def reduce_ipg_grads(self):
+        self.average_tensor(self.ipg_buffer[self.ipg_index].narrow(0, 0, self.elements_in_ipg_bucket))
+
+        stream = self.reduction_stream
+
+        with torch.cuda.stream(stream):
+            for _, param, param_id in self.params_in_ipg_bucket:
+                self.params_already_reduced[param_id] = True
+                if not self.is_param_in_current_partition[param_id]:
+                    self.clear_grad_attribute(param)
+                elif self.contiguous_gradients:
+                    self.copy_grads_in_partition(param)
+
+        self.grads_in_ipg_bucket = []
+        self.params_in_ipg_bucket = []
+        self.ipg_bucket_has_moe_params = False
+        self.elements_in_ipg_bucket = 0
+
+    def _clear_previous_reduced_grads(self):
+        if self.previous_reduced_grads is not None:
+            for param in self.previous_reduced_grads:
+                self.clear_grad_attribute(param)
+            self.previous_reduced_grads = None
+
+    def overlapping_partition_gradients_reduce_epilogue(self):
+        self.reduce_ipg_grads()
+        for i in range(len(self.params_already_reduced)):
+            self.params_already_reduced[i] = False
+        torch.cuda.synchronize(None)
+        self._clear_previous_reduced_grads()
+        self._release_ipg_buffers()
+        self.zero_grad(set_to_none=True)
+
+    def has_overflow_partitioned_grads_serial(self):
+        for i in range(len(self.bit16_groups)):
+            for j, grad in enumerate(self.averaged_gradients[i]):
+                if grad is not None and self._has_inf_or_nan(grad.data, j):
+                    return True
+        return False
+
+    def has_overflow_serial(self, params, is_grad_list=False):
         for p in params:
             if p.grad is not None and self._has_inf_or_nan(p.grad.data):
                 return True
 
         return False
 
-    # `x` is a torch.Tensor
-    def _has_inf_or_nan(self, x):
-        try:
-            # if x is half, the .float() incurs an additional deep copy, but it's necessary if
-            # Pytorch's .sum() creates a one-element tensor of the same type as x
-            # (which is true for some recent version of pytorch).
-            cpu_sum = float(x.float().sum())
-            # More efficient version that can be used if .sum() returns a Python scalar
-            # cpu_sum = float(x.sum())
-        except RuntimeError as instance:
-            # We want to check if inst is actually an overflow exception.
-            # RuntimeError could come from a different error.
-            # If so, we still want the exception to propagate.
-            if "value cannot be converted" not in instance.args[0]:
-                raise
-            return True
+    def _model_parallel_all_reduce(self, tensor, op):
+        if self.model_parallel_group is None or self.model_parallel_world_size == 1:
+            pass
         else:
-            if cpu_sum in [float('inf'), -float('inf')] or cpu_sum != cpu_sum:
-                return True
-            return False
+            dist.all_reduce(tensor=tensor, op=op, group=self.model_parallel_group)
 
-    # `overflow` is boolean indicating whether the gradient overflowed
-    def update_scale(self, overflow):
-        if overflow:
-            # self.cur_scale /= self.scale_factor
-            if self.delayed_shift == 1 or self.cur_hysteresis == 1:
-                self.cur_scale = max(self.cur_scale / self.scale_factor, self.min_scale)
-            else:
-                self.cur_hysteresis -= 1
-            self.last_overflow_iter = self.cur_iter
+    def has_overflow(self, partition_gradients=True):
+        if partition_gradients:
+            overflow = self.local_overflow if self.cpu_offload else self.has_overflow_partitioned_grads_serial()
+            overflow_gpu = torch.cuda.ByteTensor([overflow])
+            dist.all_reduce(overflow_gpu, op=dist.ReduceOp.MAX, group=self.dp_process_group)
         else:
-            if self.consecutive_hysteresis:
-                self.cur_hysteresis = self.delayed_shift
-            if (self.cur_iter - self.last_overflow_iter) % self.scale_window == 0:
-                if not self.consecutive_hysteresis:
-                    self.cur_hysteresis = self.delayed_shift
-                self.cur_scale *= self.scale_factor
-        self.cur_iter += 1
+            params = []
+            for group in self.bit16_groups:
+                for param in group:
+                    params.append(param)
 
+            overflow = self.has_overflow_serial(params, is_grad_list=partition_gradients)
+            overflow_gpu = torch.cuda.ByteTensor([overflow])
 
-class DeepSpeedZeroOptimizer(object):
-    """
-    FP16_DeepSpeedZeroOptimizer_Stage1 designed to reduce the memory footprint
-    required for training large deep learning models.
+        self._model_parallel_all_reduce(tensor=overflow_gpu, op=dist.ReduceOp.MAX)
+        overflow = overflow_gpu[0].item()
+        return bool(overflow)
 
-    For more details please see ZeRO: Memory Optimization Towards Training A Trillion Parameter Models
-    https://arxiv.org/abs/1910.02054
+    def _check_overflow(self, partition_gradients=True):
+        self.overflow = self.has_overflow(partition_gradients)
 
-    This version aligns with stage-1 in the paper above.
-    """
+    def check_overflow(self, partition_gradients=True):
+        self._check_overflow(partition_gradients)
 
-    def __init__(self,
-                 init_optimizer,
-                 static_loss_scale=1.0,
-                 dynamic_loss_scale=False,
-                 dynamic_loss_args=None,
-                 verbose=True,
-                 dp_process_group=None,
-                 partition_size=None,
-                 mpu=None,
-                 allgather_size=5e8,
-                 clip_grad=0.0,
-                 max_elements_per_comm=5e8,
-                 postscale_gradients=True,
-                 gradient_predivide_factor=1.0,
-                 gradient_average=True,
-                 communication_data_type=torch.float16):
+    def _get_loss_scale(self):
+        return self.loss_scaler.cur_scale
 
-        self.flatten = _flatten_dense_tensors
-        self.unflatten = _unflatten_dense_tensors
+    def _set_loss_scale(self, value):
+        self.loss_scaler.cur_scale = value
 
-        if dp_process_group is not None and partition_size is not None:
-            raise ValueError("Cannot specify both dp_process_group "
-                             "and partition size")
+    loss_scale = property(_get_loss_scale, _set_loss_scale)
+    cur_scale = property(_get_loss_scale, _set_loss_scale)
 
-        if not torch.cuda.is_available:
-            raise SystemError("Cannot use fp16 without CUDA.")
-        self.optimizer = init_optimizer
+    def _update_scale(self, has_overflow=False):
+        self.loss_scaler.update_scale(has_overflow)
 
-        self.verbose = verbose
-        self.dp_process_group = dp_process_group
+    def reset_cpu_buffers(self):
+        self.norm_for_param_grads = {}
+        self.local_overflow = False
 
-        self.device = torch.cuda.current_device()
-
-        self.postscale_gradients = postscale_gradients
-        self.gradient_predivide_factor = gradient_predivide_factor
-        self.gradient_average = gradient_average
-
-        self.allgather_size = allgather_size
-        self.is_gradient_accumulation_boundary = True
-
-        self.communication_data_type = communication_data_type
-
-        self.max_elements_per_comm = max_elements_per_comm
-        logger.info("max_elements_per_comm={}".format(max_elements_per_comm))
-
-        # param flattened by groups
-        self.fp16_groups = []
-        self.fp16_groups_flat = []
-
-        # Setup bookkeeping data structures depending on partitioning type
-
-        # parallel_sub_partitioned_fp16_groups[group-idx] -> [comm-ids] -> [rank-ids]
-        self.parallel_sub_partitioned_fp16_groups = []
-        # same underlying data as above but viewed as: [groups] -> [rank-ids] -> [comm-ids]
-        self.parallel_comm_sub_partitioned_fp16_groups = []
-
-        # 32-bit sub-partitions of the parallel partitioned parameters
-        # that this process will update
-        self.local_sub_partitions_of_fp32_groups = []
-
-        # param partition info
-
-        # parameters in each group that will not be updated by this process directly
-        self.params_not_local = []
-
-        # parameters that will be updated by this process directly
-        self.params_in_rank_sub_partitions = []
-
-        # parameter offsets for parameters in sub-partitions. Parameter
-        # boundaries may not align with sub-partition boundaries
-        # so we need to keep track of the offsets
-        self.params_in_rank_sub_partitions_offsets = []
-
-        # number of elements per sub-partition in each group
-        self.sub_partition_sizes = []
-
-        # number of communication intervals for each group
-        self.num_comm_intervals_per_group = []
-
-        local_rank = dist.get_rank(group=self.dp_process_group)
-
-        self.group_paddings = []
-        self.partition_count = dist.get_world_size(group=self.dp_process_group)
-
-        self.default_device = self.optimizer.param_groups[0]['params'][0].device
-
-        # max elems per param group
-        self.max_elems_per_comm = []
-
-        # loop to deal with groups
-        for i, param_group in enumerate(self.optimizer.param_groups):
-            # push this group to list before modify
-            self.fp16_groups.append(param_group['params'])
-
-            # calculate best max elements per comm based to minimize padding
-            self.max_elems_per_comm.append(
-                self.best_max_elems_per_comm(
-                    num_elements=sum(t.numel() for t in self.fp16_groups[i]),
-                    max_elements_per_comm=max_elements_per_comm,
-                    dp=dist.get_world_size(group=self.dp_process_group)))
-
-            move_to_cpu(self.fp16_groups[i])
-
-            # flattens all tensors into single 1d tensor aligned with sub-partition size for later dividing
-            # RS: create aligned sub-partitions
-            self.fp16_groups_flat.append(self.flatten_dense_tensors_sub_partition_aligned(
-                tensor_list=self.fp16_groups[i],
-                dp=dist.get_world_size(group=self.dp_process_group),
-                max_elements_per_comm=self.max_elems_per_comm[i],
-                pg=self.dp_process_group).cuda(torch.cuda.current_device()))
-
-            # TODO: I don't think this does anything?
-            # set model fp16 weight to slices of flattened buffer
-            updated_params = self.unflatten(self.fp16_groups_flat[i],
-                                            self.fp16_groups[i])
-
-            for p, q in zip(self.fp16_groups[i], updated_params):
-                p.data = q.data
-
-            # divide the flat weights into near equal partition equal to the data parallel degree
-            # each process will compute on a different part of the partition
-            # RS: split into two layer list -> [comm-id] -> [sub-partitions per rank]
-            comm_partitions, dp_sub_partitions, element_intervals, sub_partition_size, num_comm_intervals = \
-                self.get_data_parallel_sub_partitions(
-                    tensor=self.fp16_groups_flat[i],
-                    max_elements_per_comm=self.max_elems_per_comm[i],
-                    world_size=dist.get_world_size(
-                        group=self.dp_process_group),
-                    dp_process_group=self.dp_process_group
-                )
-
-            self.parallel_comm_sub_partitioned_fp16_groups.append(
-                comm_partitions)  # comm -> rank
-
-            self.parallel_sub_partitioned_fp16_groups.append(
-                dp_sub_partitions)  # rank -> comm
-
-            self.sub_partition_sizes.append(sub_partition_size)
-
-            self.num_comm_intervals_per_group.append(num_comm_intervals)
-
-            # a partition of the fp32 master weights that will be updated by this process
-            # RS: store/detach/cast our local sub-partitions
-            local_sub_partitions = []
-            for sub_partition in self.parallel_sub_partitioned_fp16_groups[i][local_rank]:
-                fp32_sub_partition = sub_partition.clone().float().detach()
-                # fp32_sub_partition = sub_partition.clone().detach()
-                fp32_sub_partition.requires_grad = True
-                local_sub_partitions.append(fp32_sub_partition)
-
-            self.local_sub_partitions_of_fp32_groups.append(local_sub_partitions)
-
-            # Compute sub_partition paddings
-            sub_partition_paddings = get_group_alignment_padding(
-                tensor_list=self.fp16_groups[i],
-                sub_partition_size=sub_partition_size,
-                sub_partition_count=num_comm_intervals * self.partition_count)
-
-            self.group_paddings.append(sub_partition_paddings)
-
-            # modify optimizer of have flat master weight
-            # self.single_partition_of_fp32_groups[i].requires_grad = True # keep this in case internal optimizer uses it
-            param_group['params'] = self.local_sub_partitions_of_fp32_groups[i]
-
-            # RS: divide up the sub-partitions and keep track of offsets for each param
-            # partition_size = len(self.fp16_groups_flat[i]) / dist.get_world_size(group=self.dp_process_group)
-            params_in_rank_sub_partition, params_in_rank_sub_partitions_offsets, params_not_local = self.get_all_sub_partition_info(
-                tensor_list=self.fp16_groups[i],
-                all_element_intervals=element_intervals,
-                local_rank=local_rank,
-                world_size=dist.get_world_size(group=self.dp_process_group)
-            )
-
-            self.params_in_rank_sub_partitions.append(params_in_rank_sub_partition)
-
-            self.params_not_local.append(params_not_local)
-
-            self.params_in_rank_sub_partitions_offsets.append(
-                params_in_rank_sub_partitions_offsets)
-
-        # we may have a way of fusing dynamic scale. Do not support for now
-        if dynamic_loss_scale:
-            if dynamic_loss_args is None:
-                self.loss_scaler = DynamicLossScaler()
-            else:
-                self.loss_scaler = DynamicLossScaler(**dynamic_loss_args)
-
-            self.dynamic_loss_scale = True
-
-        else:
-            self.dynamic_loss_scale = False
-            self.loss_scaler = LossScaler(scale=static_loss_scale)
-            self.cur_iter = 0
-
-        self.mpu = mpu
-        self.clip_grad = clip_grad
-
-        self.overflow = False
-        self.overflow_checker = CheckOverflow(self.fp16_groups,
-                                              mpu=self.mpu,
-                                              zero_reduce_scatter=True)
-
-    @staticmethod
-    def best_max_elems_per_comm(num_elements, max_elements_per_comm, dp):
-        # if we use max-elems-per-comm as is, how many comm intervals will there be
-        max_comm_intervals = math.ceil(num_elements / max_elements_per_comm)
-        padding_for_max_comm = (max_elements_per_comm *
-                                max_comm_intervals) - num_elements
-
-        # if we use 1 less comm interval how much extra comm padding would be required
-        min_comm_intervals = num_elements // max_elements_per_comm
-        if min_comm_intervals == 0:
-            return max_elements_per_comm
-
-        padding_for_min_comm = math.ceil(num_elements / (dp * min_comm_intervals))
-
-        # choose padding that uses least amount of overhead
-        if padding_for_max_comm > padding_for_min_comm:
-            new_max_elements_per_comm = padding_for_min_comm + max_elements_per_comm
-            return new_max_elements_per_comm
-        else:
-            return max_elements_per_comm
-
-    @staticmethod
-    def get_data_parallel_sub_partitions(tensor,
-                                         max_elements_per_comm,
-                                         world_size,
-                                         dp_process_group=None):
-        total_num_elements = tensor.numel()
-
-        # if total elements is less than our max, revert to splitting into dp partitions
-        max_elements_per_comm = min(total_num_elements, max_elements_per_comm)
-        sub_partition_size = int(max_elements_per_comm // world_size)
-
-        # Ensure partition alignment was done correctly
-        num_sub_partitions = int(total_num_elements // sub_partition_size)
-        assert total_num_elements % sub_partition_size == 0, "{} % {} != 0".format(total_num_elements,
-                                                                                   sub_partition_size)
-
-        # Ensure comm interval alignment was done correctly.
-        num_comm_intervals = int(num_sub_partitions // world_size)
-        assert num_sub_partitions % world_size == 0, "{} % {} != 0".format(num_sub_partitions, world_size)
-
-        # [comm_id] -> [rank]
-        comm_partitions = []
-        for _ in range(num_comm_intervals):
-            comm_partitions.append([])
-
-        start = 0
-        comm_id = 0
-        element_intervals = defaultdict(
-            list)  # [rank] -> [(start,end), (start,end), ...]
-
-        for idx in range(num_sub_partitions):
-            rank_id = idx % world_size
-            sub_partition = tensor.narrow(0, start, sub_partition_size).detach()
-            element_intervals[rank_id].append((start, start + sub_partition_size))
-            comm_partitions[comm_id].append(sub_partition)
-            start = start + sub_partition_size
-            if rank_id == (world_size - 1):
-                comm_id += 1
-
-        # [rank] -> [comm_id]
-        sub_partitions = []
-        for _ in range(world_size):
-            sub_partitions.append([])
-        for comm_id, partitions in enumerate(comm_partitions):
-            for rank_id, partition in enumerate(partitions):
-                sub_partitions[rank_id].append(partition)
-        return comm_partitions, sub_partitions, element_intervals, sub_partition_size, num_comm_intervals
-
-    @staticmethod
-    def get_all_sub_partition_info(tensor_list,
-                                   all_element_intervals,
-                                   local_rank,
-                                   world_size):
-        params_not_local = []
-
-        # [rank] -> [comm-id] -> [param/offset]
-        params_in_rank_sub_partition = []
-        params_in_rank_sub_partitions_offsets = []
-
-        for rank in range(world_size):
-            params_in_local_sub_partition = []
-            local_sub_partition_offsets = []
-            comm_tensor_list = []
-            comm_offset_list = []
-            current_index = 0
-            prev_comm_idx = 0
-            for iii, tensor in enumerate(tensor_list):
-                tensor_size = tensor.numel()
-                results_list = _range_check(current_index,
-                                            all_element_intervals[rank],
-                                            tensor_size)
-                for contained, offset, comm_idx in results_list:
-                    if contained:
-                        if prev_comm_idx != comm_idx:
-                            params_in_local_sub_partition.append(comm_tensor_list)
-                            comm_tensor_list = []
-                            local_sub_partition_offsets.append(comm_offset_list)
-                            comm_offset_list = []
-                        comm_tensor_list.append(tensor)
-                        comm_offset_list.append(offset)
-                        prev_comm_idx = comm_idx
-                    elif rank == local_rank:
-                        params_not_local.append(tensor)
-
-                current_index = current_index + tensor_size
-
-            # assert len(comm_tensor_list) > 0
-            # assert len(comm_offset_list) > 0
-            params_in_local_sub_partition.append(comm_tensor_list)
-            local_sub_partition_offsets.append(comm_offset_list)
-
-            params_in_rank_sub_partition.append(params_in_local_sub_partition)
-            params_in_rank_sub_partitions_offsets.append(local_sub_partition_offsets)
-
-        return params_in_rank_sub_partition, params_in_rank_sub_partitions_offsets, params_not_local
-
-    def get_flat_sub_partitions(self,
-                                comm_tensor_list,
-                                comm_param_offsets,
-                                sub_partition_size,
-                                dtype,
-                                default_device,
-                                num_comm_intervals=None,
-                                return_partition_params=False):
-        partition_params = []
-        final_param_offsets = []
-        flat_sub_partitions = []
-        for tensor_list, param_offsets in zip(comm_tensor_list, comm_param_offsets):
-            flat_tensor_list = []
-            current_size = 0
-            my_offsets = []
-            my_params = []
-            for i, tensor in enumerate(tensor_list):
-                if tensor.grad is None:
-                    tensor.grad = torch.zeros(tensor.size(),
-                                              dtype=tensor.dtype,
-                                              device=tensor.device)
-                param = tensor
-                tensor = tensor.grad
-                num_elements = tensor.numel()
-                tensor_offset = 0
-
-                # we need to offset to get to the right element
-                if i == 0 and param_offsets[i] > 0:
-                    tensor_offset = param_offsets[i]
-                    num_elements = num_elements - tensor_offset
-
-                # We don't need all elements of the tensor if this tensor is
-                # larger than we have space for in our curr sub-partition
-                if num_elements > (sub_partition_size - current_size):
-                    num_elements = sub_partition_size - current_size
-
-                # we need a narrow view of the tensor based on the tensor offset and number of elements that
-                # we need from this tensor
-                if tensor_offset > 0 or num_elements < tensor.numel():
-                    flat_tensor_list.append(tensor.contiguous().view(-1).narrow(
-                        0,
-                        int(tensor_offset),
-                        int(num_elements)).to(dtype))
-                else:
-                    flat_tensor_list.append(tensor.to(dtype))
-                my_params.append(param)
-
-                # remember offset into partition and #elems for this tensor
-                my_offsets.append((current_size, num_elements))
-
-                current_size = current_size + num_elements
-
-            # this means its the last partition and does not align with the dp boundary. We need to pad before flattening
-            if current_size < sub_partition_size:
-                my_offsets.append((None, None))
-                my_params.append(None)
-                if len(tensor_list) == 0:
-                    assert default_device != None
-                    flat_tensor_list.append(
-                        torch.zeros(int(sub_partition_size - current_size),
-                                    dtype=dtype,
-                                    device=default_device))
-                else:
-                    rank = dist.get_rank()
-                    flat_tensor_list.append(
-                        torch.zeros(int(sub_partition_size - current_size),
-                                    dtype=dtype,
-                                    device=tensor_list[0].device))
-            # partition_params.append(my_params)  #flat_tensor_list)
-            partition_params.append(flat_tensor_list)
-            final_param_offsets.append(my_offsets)
-            assert len(flat_tensor_list) == len(my_offsets), "{} {}".format(len(flat_tensor_list), len(my_offsets))
-            flat_sub_partitions.append(self.flatten(flat_tensor_list))
-
-        if num_comm_intervals is not None and len(
-                flat_sub_partitions) < num_comm_intervals:
-            # logger.info("padding w. sub partitions to ensure uniform communication")
-            device = flat_sub_partitions[0].device
-            for _ in range(num_comm_intervals - len(flat_sub_partitions)):
-                flat_sub_partitions.append(
-                    torch.zeros(int(sub_partition_size),
-                                dtype=dtype,
-                                device=device))
-                final_param_offsets.append([(None, None)])
-
-        if return_partition_params:
-            assert len(flat_sub_partitions) == len(partition_params)
-            assert len(partition_params) == len(final_param_offsets), "{} {}".format(len(partition_params),
-                                                                                     len(final_param_offsets))
-            return flat_sub_partitions, partition_params, final_param_offsets
-        return flat_sub_partitions, partition_params
-
-    def zero_grad(self, set_grads_to_None=True):
-        """
-        Zero FP16 parameter grads.
-        """
-        # FP32 grad should never exist.
-        # For speed, set model fp16 grad to None by default
-        for group in self.fp16_groups:
-            for p in group:
-                if set_grads_to_None:
-                    p.grad = None
-                else:
-                    if p.grad is not None:
-                        p.grad.detach_()
-                        p.grad.zero_()
-
-    def free_grad_in_param_list(self, param_list):
-        for p in param_list:
-            if isinstance(p, list):
-                for _p in p:
-                    _p.grad = None
-            else:
-                p.grad = None
-
-    def flatten_dense_tensors_sub_partition_aligned(self,
-                                                    tensor_list,
-                                                    dp,
-                                                    max_elements_per_comm,
-                                                    pg):
-        assert max_elements_per_comm >= dp, f"max_elements_per_comm {max_elements_per_comm} < dp {dp}"
-
-        num_elements = sum(t.numel() for t in tensor_list)
-
-        # Compute aligned partition size based on parameter count
-        aligned_param_partition_size = math.ceil(num_elements / dp)
-
-        # Compute aligned partition size based on communication size
-        aligned_comm_partition_size = int(max_elements_per_comm // dp)
-
-        if aligned_param_partition_size <= aligned_comm_partition_size:
-            sub_partition_count = 1
-            sub_partition_size = aligned_param_partition_size
-        else:
-            sub_partition_count = math.ceil(aligned_param_partition_size /
-                                            aligned_comm_partition_size)
-            sub_partition_size = aligned_comm_partition_size
-
-        # Compute required padding  for alignment to dp and max_elements_per_comm
-        padding = (sub_partition_count * sub_partition_size * dp) - num_elements
-
-        if padding == 0:
-            aligned_tensor_list = tensor_list
-        else:
-            pad_tensor = torch.zeros(padding,
-                                     device=tensor_list[0].device,
-                                     dtype=tensor_list[0].dtype)
-            aligned_tensor_list = tensor_list + [pad_tensor]
-        flat_tensors = self.flatten(aligned_tensor_list)
-        return flat_tensors
-
-    def reduce_gradients(self, pipeline_parallel=False):
-        # pass
-        postscale_gradients = self.postscale_gradients
-        gradient_predivide_factor = self.gradient_predivide_factor
-        gradient_average = self.gradient_average
-
-        world_size = dist.get_world_size(group=self.dp_process_group)
-        local_rank = dist.get_rank(group=self.dp_process_group)
-
-        for i, group in enumerate(self.fp16_groups):
-            num_comm_intervals = self.num_comm_intervals_per_group[i]
-            all_sub_partitions = []
-            all_partition_params = []
-            for rank in range(world_size):
-                # gsp is list of partitions indexed by comm_idx
-                grad_sub_partitions, partition_params = self.get_flat_sub_partitions(
-                    comm_tensor_list=self.params_in_rank_sub_partitions[i][rank],
-                    comm_param_offsets=self.params_in_rank_sub_partitions_offsets[i]
-                    [rank],
-                    dtype=self.communication_data_type,
-                    default_device=self.default_device,
-                    sub_partition_size=self.sub_partition_sizes[i],
-                    num_comm_intervals=self.num_comm_intervals_per_group[i])
-                all_sub_partitions.append(grad_sub_partitions)
-                all_partition_params.append(partition_params)
-
-                assert len(grad_sub_partitions) == num_comm_intervals
-
-            local_comm_partitions = []
-            for comm_idx in range(num_comm_intervals):
-                single_comm_all_partitions = []
-                for rank in range(world_size):
-                    single_comm_all_partitions.append(all_sub_partitions[rank][comm_idx])
-                if postscale_gradients:
-                    if gradient_predivide_factor != 1.0:
-                        for partition in single_comm_all_partitions:
-                            partition.mul_(1. / gradient_predivide_factor)
-
-                    for partition in single_comm_all_partitions:
-                        dist.all_reduce(partition, group=self.dp_process_group)
-                    if gradient_average:
-                        # Only need to average our local grads in post scaling
-                        if gradient_predivide_factor != world_size:
-                            single_comm_all_partitions[local_rank].mul_(
-                                gradient_predivide_factor / world_size)
-                else:
-                    for partition in single_comm_all_partitions:
-                        partition.div_(world_size)
-
-                    for partition in single_comm_all_partitions:
-                        dist.all_reduce(partition, group=self.dp_process_group)
-
-                for buf, synced in zip(all_partition_params[local_rank][comm_idx],
-                                       self.unflatten(single_comm_all_partitions[local_rank],
-                                                      all_partition_params[local_rank][comm_idx])):
-                    buf.copy_(synced)
-
-    def step(self, closure=None):
-        # First compute norm for all group so we know if there is overflow
-        self.overflow = self.overflow_checker.check()
-
-        prev_scale = self.loss_scale
-        self._update_scale(self.overflow)
-        if self.overflow:
-            self.zero_grad()
-            if self.verbose:
-                logger.info(
-                    "[deepspeed] fp16 dynamic loss scale overflow! Skipping step. Attempted loss "
-                    "scale: {}, reducing to {}".format(prev_scale,
-                                                       self.loss_scale))
-            return self.overflow
-
-        norm_groups = []
-        local_sub_partitions_grad_groups = []
-        partition_id = dist.get_rank(group=self.dp_process_group)
-        world_size = dist.get_world_size(group=self.dp_process_group)
-        for i, group in enumerate(self.fp16_groups):
-            # TODO RS: update get grad norm to support sub partitions
-            # RS: update free grads w.r.t. sub partitions
-            # free gradients for all the parameters that are not updated by this process
-            self.free_grad_in_param_list(self.params_not_local[i])
-            # create flat gradient partitions for parameters updated by this process
-            local_grad_sub_partitions, partition_params = self.get_flat_sub_partitions(
-                comm_tensor_list=self.params_in_rank_sub_partitions[i][partition_id],
-                comm_param_offsets=self.params_in_rank_sub_partitions_offsets[i]
-                [partition_id],
-                sub_partition_size=self.sub_partition_sizes[i],
-                dtype=self.local_sub_partitions_of_fp32_groups[i][0].dtype,
-                num_comm_intervals=self.num_comm_intervals_per_group[i],
-                default_device=self.default_device)
-
-            norm_groups.append(get_grad_norm(local_grad_sub_partitions, partition_params, mpu=self.mpu))
-
-            # RS: update all our local params with sub-partition grads
-            for idx, sub_partition_param in enumerate(self.local_sub_partitions_of_fp32_groups[i]):
-                sub_partition_param.grad = local_grad_sub_partitions[idx]
-
-            # RS: update free grads for sub-partitions
-            # release all the gradient since we have already created a necessary copy in dp_grad_partition
-            self.free_grad_in_param_list(
-                self.params_in_rank_sub_partitions[i][partition_id])
-
-            local_sub_partitions_grad_groups.append(local_grad_sub_partitions)
-
-        # RS: update unscale/clip with sub partitions
-
-        self.unscale_and_clip_grads(local_sub_partitions_grad_groups, norm_groups)
-
-        self.optimizer.step()
-
-        # RS: clear our sub partition grads
-        # get rid of the fp32 gradients. Not needed anymore
-        for group in self.local_sub_partitions_of_fp32_groups:
-            for idx, sub_partition_param in enumerate(group):
-                sub_partition_param.grad = None
-            # group.grad = None
-
-        # NOTE RS: removed norm_groups outer loop from original code, i don't think it's needed
-        # RS: copy all sub-partition fp32 data to fp16 sub partitions
-        # copy fp32 param data to fp16 partitions w.r.t. our local rank
-        for fp16_all_sub_partitions, fp32_local_sub_partitions in zip(self.parallel_sub_partitioned_fp16_groups,
-                                                                      self.local_sub_partitions_of_fp32_groups):
-            for local_sub_partition_param_fp16, local_sub_partition_param_fp32 in zip(
-                    fp16_all_sub_partitions[partition_id], fp32_local_sub_partitions):
-                local_sub_partition_param_fp16.data.copy_(
-                    local_sub_partition_param_fp32.data)
-
-        # RS: all_gather/broadcast sub-partitions in separate comm calls
-        # gather the updated weights from everyone
-        for fp16_all_sub_partitions in self.parallel_comm_sub_partitioned_fp16_groups:
-            for comm_id, sub_partitions in enumerate(fp16_all_sub_partitions):
-                dist.all_gather(sub_partitions,
-                                sub_partitions[partition_id],
-                                group=self.dp_process_group)
-
-        # TODO: we probably don't need this? just to be safe
-        for i in range(len(norm_groups)):
-            updated_params = self.unflatten(self.fp16_groups_flat[i],
-                                            self.fp16_groups[i])
-            for p, q in zip(self.fp16_groups[i], updated_params):
-                p.data = q.data
-
-        return self.overflow
-
-    def unscale_and_clip_grads(self, grad_groups_flat, norm_groups):
+    def complete_grad_norm_calculation_for_cpu_offload(self, params):
         total_norm = 0.0
-        for norm in norm_groups:
-            total_norm += norm ** 2.0
-        total_norm = math.sqrt(total_norm)
+        norm_type = 2.0
+        for p in params:
+            if hasattr(p, PIPE_REPLICATED) and p.ds_pipe_replicated:
+                continue
+            if is_model_parallel_parameter(p) or (self.model_parallel_rank == 0):
+                param_id = self.get_param_id(p)
+                # as some model have trainable parameters but skipped in training,
+                # their backward hooks in self.create_reduce_and_remove_grad_hooks() will not run,
+                # so they have no norm_for_param_grads
+                if param_id in self.norm_for_param_grads:
+                    param_norm = self.norm_for_param_grads[param_id]
+                    total_norm += param_norm.item() ** 2
 
-        # compute combined scale factor for this group
+        total_norm_cuda = torch.cuda.FloatTensor([float(total_norm)])
+        dist.all_reduce(total_norm_cuda, op=dist.ReduceOp.SUM, group=self.dp_process_group)
+
+        self._model_parallel_all_reduce(tensor=total_norm_cuda, op=dist.ReduceOp.SUM)
+
+        total_norm = total_norm_cuda[0].item() ** (1. / norm_type)
+
+        if total_norm == float('inf') or total_norm == -float('inf') or total_norm != total_norm:
+            total_norm = -1
+
+        return total_norm
+
+    def scaled_global_norm(self, norm_type=2):
+        norm_groups = []
+        for i, group in enumerate(self.bit16_groups):
+            partition_id = dist.get_rank(group=self.real_dp_process_group[i])
+            norm_groups.append(self.complete_grad_norm_calculation_for_cpu_offload(self.params_in_partition[i]))
+            single_grad_partition = self.single_partition_of_fp32_groups[i].grad
+        return get_global_norm(norm_list=norm_groups)
+
+    def unscale_and_clip_grads(self, grad_groups_flat, total_norm):
         combined_scale = self.loss_scale
         if self.clip_grad > 0.:
             # norm is in fact norm*scale
@@ -963,91 +897,70 @@ class DeepSpeedZeroOptimizer(object):
             else:
                 grad.data.mul_(1. / combined_scale)
 
+    def _optimizer_step(self, group_no):
+        original_param_groups = self.optimizer.param_groups
+        self.optimizer.param_groups = [original_param_groups[group_no]]
+        self.optimizer.step()
+        self.optimizer.param_groups = original_param_groups
+
+    # #######################################
+    def zero_grad(self, set_to_none=True):
+        for group in self.bit16_groups:
+            for p in group:
+                if set_to_none:
+                    p.grad = None  # epilogue and in step
+                    p.grad_accum = None
+                else:
+                    if p.grad is not None:
+                        p.grad.detach_()
+                        p.grad.zero_()
+
     def backward(self, loss, retain_graph=False):
+        self.micro_step_id += 1
+
+        self.ipg_buffer = []
+        buf_0 = torch.empty(int(self.reduce_bucket_size),
+                            dtype=self.dtype,
+                            device='cuda:{}'.format(torch.cuda.current_device()))
+        self.ipg_buffer.append(buf_0)
+
+        buf_1 = torch.empty(int(self.reduce_bucket_size),
+                            dtype=self.dtype,
+                            device='cuda:{}'.format(torch.cuda.current_device()))
+        self.ipg_buffer.append(buf_1)
+        self.ipg_index = 0
+
         self.loss_scaler.backward(loss.float(), retain_graph=retain_graph)
 
-    def _update_scale(self, has_overflow=False):
-        self.loss_scaler.update_scale(has_overflow)
+    def step(self, closure=None):
+        self.micro_step_id = -1
+        self.check_overflow()
+        prev_scale = self.loss_scale
+        self._update_scale(self.overflow)
+        if self.overflow:
+            self.zero_grad(set_to_none=True)
+            if self.cpu_offload:
+                self.reset_cpu_buffers()
+            return
 
-    # # Promote state so it can be retrieved or set via "fp16_optimizer_instance.state"
-    def _get_state(self):
-        return self.optimizer.state
+        scaled_global_grad_norm = self.scaled_global_norm()
+        self._global_grad_norm = scaled_global_grad_norm / prev_scale
+        for i, group in enumerate(self.bit16_groups):
+            partition_id = dist.get_rank(group=self.real_dp_process_group[i])
+            single_grad_partition = self.single_partition_of_fp32_groups[i].grad
+            self.unscale_and_clip_grads([single_grad_partition], scaled_global_grad_norm)
+            self._optimizer_step(i)
+            bit16_partitions = self.parallel_partitioned_bit16_groups[i]
+            fp32_partition = self.single_partition_of_fp32_groups[i]
+            bit16_partitions[partition_id].data.copy_(
+                fp32_partition.to('cuda:{}'.format(torch.cuda.current_device())).data)
+        self.reset_cpu_buffers()
 
-    def _set_state(self, value):
-        self.optimizer.state = value
-
-    state = property(_get_state, _set_state)
-
-    # Promote param_groups so it can be retrieved or set via "fp16_optimizer_instance.param_groups"
-    # (for example, to adjust the learning rate)
-    def _get_param_groups(self):
-        return self.optimizer.param_groups
-
-    def _set_param_groups(self, value):
-        self.optimizer.param_groups = value
-
-    param_groups = property(_get_param_groups, _set_param_groups)
-
-    # Promote loss scale so it can be retrieved or set via "fp16_optimizer_instance.loss_scale"
-    def _get_loss_scale(self):
-        return self.loss_scaler.loss_scale
-
-    def _set_loss_scale(self, value):
-        self.loss_scaler.cur_scale = value
-
-    loss_scale = property(_get_loss_scale, _set_loss_scale)
-    cur_scale = property(_get_loss_scale, _set_loss_scale)
-
-    def _rigid_state_dict(self):
-        state_dict = {'loss_scaler': self.loss_scaler,
-                      'dynamic_loss_scale': self.dynamic_loss_scale,
-                      'overflow': self.overflow,
-                      'base_optimizer_state': self.optimizer.state_dict(),
-                      'local_sub_partitions_of_fp32_groups': self.local_sub_partitions_of_fp32_groups}
-        return state_dict
-
-    def state_dict(self):
-        """
-        Returns a dict containing the current state of this :class:`FP16_Optimizer` instance.
-        This dict contains attributes of :class:`FP16_Optimizer`, as well as the state_dict
-        of the contained Pytorch optimizer.
-        """
-
-        return self._rigid_state_dict()
-
-    def _rigid_load_state_dict(self, state_dict, load_optimizer_states=True):
-
-        # I think it should actually be ok to reload the optimizer before the model.
-        self.loss_scaler = state_dict['loss_scaler']
-        self.dynamic_loss_scale = state_dict['dynamic_loss_scale']
-        self.overflow = state_dict['overflow']
-        if load_optimizer_states:
-            self.optimizer.load_state_dict(state_dict['base_optimizer_state'])
-
-        for curr_group, saved_group in zip(self.local_sub_partitions_of_fp32_groups,
-                                           state_dict['local_sub_partitions_of_fp32_groups']):
-            for curr_param, saved_param in zip(curr_group, saved_group):
-                curr_param.data.copy_(saved_param.data)
-
-    def load_state_dict(self,
-                        state_dict,
-                        load_optimizer_states=True,
-                        load_from_fp32_weights=False):
-        """
-        Loads a state_dict created by an earlier call to state_dict().
-        If ``fp16_optimizer_instance`` was constructed from some ``init_optimizer``,
-        whose parameters in turn came from ``model``, it is expected that the user
-        will call ``model.load_state_dict()`` before
-        ``fp16_optimizer_instance.load_state_dict()`` is called.
-        Example::
-            model = torch.nn.Linear(D_in, D_out).cuda().half()
-            optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
-            optimizer = FP16_Optimizer(optimizer, static_loss_scale = 128.0)
-            ...
-            checkpoint = torch.load("saved.pth")
-            model.load_state_dict(checkpoint['model'])
-            optimizer.load_state_dict(checkpoint['optimizer'])
-        """
-        self._rigid_load_state_dict(
-            state_dict,
-            load_optimizer_states)
+        all_gather_dp_groups(groups_flat=self.bit16_groups_flat,
+                             partitioned_param_groups=self.parallel_partitioned_bit16_groups,
+                             dp_process_group=self.real_dp_process_group,
+                             start_alignment_factor=self.nccl_start_alignment_factor,
+                             allgather_bucket_size=self.allgather_bucket_size)
+        for i in range(len(self.bit16_groups)):
+            self._update_model_bit16_weights(i)
+        return

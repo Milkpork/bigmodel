@@ -46,3 +46,11 @@ class ZeroStageEnum(int, Enum):
     gradients = 2
     weights = 3
     max_stage = 3
+
+
+FP32_WEIGHT_KEY = "fp32"
+PARAM = 'param'
+VOCAB_TENSOR = 'vocab_tensor'
+CAT_DIM = "cat_dim"
+PARAM_N_SUB_PARAMS = "param_n_sub_params"
+PIPE_REPLICATED = 'ds_pipe_replicated'

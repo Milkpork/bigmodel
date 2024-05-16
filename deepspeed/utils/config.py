@@ -23,3 +23,10 @@ Zero_stage = 2  # now only support stage 2
 Overlap_comm = False
 Contiguous_gradients = True
 Round_robin_gradients = False
+
+Scheduler_name = "WarmupLR"
+Scheduler_config = {
+    "warmup_min_lr": 0,
+    "warmup_max_lr": 0.001,
+    "warmup_num_steps": 1000
+}

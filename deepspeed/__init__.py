@@ -1,7 +1,8 @@
 import torch
 from deepspeed.utils.config import *
 from deepspeed import comm as dist
-from deepspeed.runtime import DeepSpeedConfig, DeepSpeedEngine
+from deepspeed.runtime import DeepSpeedEngine
+from deepspeed.comm import init_distributed
 
 
 def add_core_arguments(parser):
@@ -50,23 +51,15 @@ def initialize(args=None,
                optimizer=None,
                model_parameters=None,
                training_data=None):
-    # Disable zero.Init context if it's currently enabled
-    # zero.partition_parameters.shutdown_init_context()
 
     assert model is not None, "deepspeed.initialize requires a model"
 
     dist_backend = Communication_backend_name
     dist.init_distributed(dist_backend=dist_backend)
-
-    config = args.deepspeed_config  # config path
-
     engine = DeepSpeedEngine(model=model,
                              optimizer=optimizer,
                              model_parameters=model_parameters,
                              training_data=training_data)
-
-    # Restore zero.Init context if necessary
-    # zero.partition_parameters.restore_init_context()
 
     return_items = [engine, engine.optimizer, engine.training_dataloader, engine.lr_scheduler]
     return tuple(return_items)

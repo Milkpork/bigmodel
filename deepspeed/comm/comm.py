@@ -11,12 +11,58 @@ from datetime import timedelta
 cdb = None
 
 
+def get_caller_func(frame=3):
+    import sys
+    return sys._getframe(frame).f_code.co_name
+
+
 def is_initialized():
     # assert cdb is not None, 'DeepSpeed backend not set, please initialize it using init_process_group()'
     if cdb is None:
         return False
     else:
         return cdb.is_initialized()
+
+
+def all_gather_into_tensor(output_tensor,
+                           tensor,
+                           group=None,
+                           async_op=False,
+                           prof=False,
+                           log_name='all_gather_into_tensor',
+                           debug=get_caller_func()):
+    global cdb
+    return cdb.all_gather_into_tensor(output_tensor=output_tensor, input_tensor=tensor, group=group, async_op=async_op)
+
+
+def all_gather(tensor_list,
+               tensor,
+               group=None,
+               async_op=False,
+               prof=False,
+               log_name='all_gather',
+               debug=get_caller_func()):
+    global cdb
+    return cdb.all_gather(tensor_list=tensor_list, tensor=tensor, group=group, async_op=async_op)
+
+
+def has_all_gather_into_tensor():
+    global cdb
+    assert cdb is not None and cdb.is_initialized(
+    ), 'DeepSpeed backend not set, please initialize it using init_process_group()'
+    return cdb.has_all_gather_into_tensor()
+
+
+def reduce(tensor,
+           dst,
+           op=ReduceOp.SUM,
+           group=None,
+           async_op=False,
+           prof=False,
+           log_name='reduce',
+           debug=get_caller_func()):
+    global cdb
+    return cdb.reduce(tensor=tensor, dst=dst, op=op, group=group, async_op=async_op)
 
 
 def all_reduce(tensor,
